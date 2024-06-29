@@ -12,6 +12,7 @@ Options:
    --N=<N>              Number of gas particles if particle output [default: 125000]
    --res=<N>            Number of dimensions across if grid output [default: 256]
    --density_exponent=<f>   Power law exponent of the density profile [default: 0.0]
+   --cloud_temp=<f>     Temperature of cloud in Kelvin [default: 5]
    --spin=<f>           Spin parameter: fraction of binding energy in solid-body rotation [default: 0.0]
    --omega_exponent=<f>  Powerlaw exponent of rotational frequency as a function of cylindrical radius [default: 0.0]
    --turb_type=<s>      Type of initial turbulent velocity (and possibly density field): 'gaussian' or 'full' [default: gaussian]
@@ -21,6 +22,7 @@ Options:
    --bfixed=<f>         Magnetic field in magnitude in code units, used instead of bturb if not set to zero [default: 0]
    --minmode=<N>        Minimum populated turbulent wavenumber for Gaussian initial velocity field, in units of pi/R [default: 2]
    --turb_path=<name>   Path to store turbulent velocity fields so that we only need to generate them once (defaults to ~/turb)
+   --turb_res=<N>       Resolution of turbulent modes [default: 256]
    --glass_path=<name>  Contains the the path of the glass file (defaults to your home directory)
    --boxsize=<f>        Simulation box size
    --Mstar=<msun>       Mass of the star/black hole, if any [default: 0.0]
@@ -29,12 +31,14 @@ Options:
    --star_stage=<N>     Evolutionary stage of the star/black hole [default: 7]
    --derefinement       Apply radial derefinement to ambient cells outside of 3* cloud radius
    --no_diffuse_gas     Remove diffuse ISM envelope fills the rest of the box with uniform density. 
+   --rho_contrast=<f>   Density contrast between diffuse gas and cloud [default: 1000]
    --phimode=<f>        Relative amplitude of m=2 density perturbation (e.g. for Boss-Bodenheimer test) [default: 0.0]
    --localdir           Changes directory defaults assuming all files are used from local directory.
    --B_unit=<gauss>     Unit of magnetic field in gauss [default: 1e4]
    --length_unit=<pc>   Unit of length in pc [default: 1]
    --mass_unit=<msun>   Unit of mass in M_sun [default: 1]
    --v_unit=<m/s>       Unit of velocity in m/s [default: 1]
+   --t_unit=<kyr>       Unit of time in kyr [default: 1]
    --turb_seed=<N>      Random seed for turbulence initialization [default: 42]
    --tmax=<N>           Maximum time to run the simulation to, in units of the freefall time [default: 5]
    --nsnap=<N>          Number of snapshots per freefall time [default: 150]
@@ -136,11 +140,13 @@ R = float(arguments["--R"])
 M_gas = float(arguments["--M"])
 N_gas = int(float(arguments["--N"]) + 0.5)
 grid_resolution = int(float(arguments["--res"]) + 0.5)
+turb_resolution = int(float(arguments["--turb_res"]) + 0.5)
 M_star = float(arguments["--Mstar"])
 v_star = np.array([float(v) for v in arguments["--v_star"].split(",")])
 spin = float(arguments["--spin"])
 omega_exponent = float(arguments["--omega_exponent"])
 turbulence = float(arguments["--alpha_turb"]) / 2
+cloud_temp = float(arguments["--cloud_temp"])
 seed = int(float(arguments["--turb_seed"]) + 0.5)
 tmax = int(float(arguments["--tmax"]))
 nsnap = int(float(arguments["--nsnap"]))
@@ -150,13 +156,17 @@ bfixed = float(arguments["--bfixed"])
 minmode = int(arguments["--minmode"])
 filename = arguments["--filename"]
 diffuse_gas = not arguments["--no_diffuse_gas"]
+rho_contrast = float(arguments["--rho_contrast"])
 localdir = arguments["--localdir"]
 param_only = arguments["--param_only"]
 B_unit = float(arguments["--B_unit"])
 length_unit = float(arguments["--length_unit"])
 mass_unit = float(arguments["--mass_unit"])
 v_unit = float(arguments["--v_unit"])
-t_unit = length_unit / v_unit
+if arguments["--t_unit"]:
+    t_unit = float(arguments["--t_unit"])
+else:
+    t_unit = length_unit / v_unit
 G = 4300.71 * v_unit**-2 * mass_unit / length_unit
 makebox = arguments["--makebox"]
 impact_param = float(arguments["--impact_param"])
@@ -206,6 +216,10 @@ else:  # default to center of box
 derefinement = arguments["--derefinement"]
 
 if output_format == "grid":
+    if makecylinder or makebox:
+        raise RuntimeError("makecylinder or makebox not implemented for grid outputs")
+    if impact_dist:    
+        raise RuntimeError("impact_dist not implemented for grid outputs")
     res_effective = grid_resolution
     N_gas = grid_resolution**3
 else:
@@ -366,34 +380,70 @@ if param_only:
     print("Parameters only run, exiting...")
     exit()
 
-dm = M_gas / N_gas
-mgas = np.repeat(dm, N_gas)
+print(f'Output format :: {output_format}')
 if output_format == "grid":
-    x = np.linspace(-R, R, [grid_resolution]*3)
-x = get_glass_coords(N_gas, glass_path)
-Nx = len(x)
-x = 2 * (x - 0.5)
-print("Computing radii...")
-r = cdist(x, [np.zeros(3)])[:, 0]
-print("Done! Sorting coordinates...")
-x = x[r.argsort()][:N_gas]
-print("Done! Rescaling...")
-x *= (float(Nx) / N_gas * 4 * np.pi / 3 / 8) ** (1.0 / 3) * R
-print("Done! Recomupting radii...")
-r = cdist(x, [np.zeros(3)])[:, 0]
-x, r = x / r.max(), r / r.max()
-print("Doing density profile...")
-rnew = r ** (3.0 / (3 + density_exponent)) * R
-x = x * (rnew / r)[:, None]
-r = np.sum(x**2, axis=1) ** 0.5
+    dx = boxsize/grid_resolution
+    left = -boxsize/2 + dx/2
+    right = boxsize/2 - dx/2
+    x = np.mgrid[left:right:grid_resolution*1j, left:right:grid_resolution*1j, left:right:grid_resolution*1j].T.reshape(N_gas,3)
+    x0 = x.copy()
+    r = np.sum(x**2, axis=1) ** 0.5
+    cm_pc = 3.08567758e18  # cm in 1 pc
+    g_Msun = 1.98841586e33 # g in 1 Msun
+    s_kyr = 3.15576e10 # s in 1 kyr
+    Msun_pc3 = g_Msun / cm_pc**3  # Msun/pc^3 in g/cm^3
+    rho_cloud = M_gas / (4 * np.pi * R**3 / (3 + density_exponent)) * Msun_pc3  # cgs density on cloud surface
+    inside = r <= R
+    rho = np.ones(N_gas) # Default ambient medium density is 1 in Enzo
+    rho[inside] = rho_contrast * (r[inside] / R)**density_exponent  # code units 
+    # From the density constrast, box size, and preferred time units, we can set all units
+    length_unit = boxsize * cm_pc
+    density_unit = rho_cloud / rho_contrast
+    mass_unit = density_unit * length_unit**3
+    t_unit *= s_kyr
+    v_unit = length_unit / (t_unit)
+
+    rho *= density_unit
+    mgas = rho * dx**3 / Msun_pc3 # Cell mass in Msun (because the rest of the code expects it)
+
+    print(f'-- length_unit   = {length_unit} cm')
+    print(f'-- density_unit  = {density_unit} g/cm**3')
+    print(f'-- mass_unit     = {mass_unit} g')
+    print(f'-- time_unit     = {t_unit} s')
+    print(f'-- velocity_unit = {v_unit} cm/s')
+
+else:
+    x = get_glass_coords(N_gas, glass_path)
+    x = 2 * (x - 0.5)
+    Nx = len(x)
+    dm = M_gas / N_gas
+    mgas = np.repeat(dm, N_gas)
+    print("Computing radii...")
+    r = cdist(x, [np.zeros(3)])[:, 0]
+    print("Done! Sorting coordinates...")
+    x = x[r.argsort()][:N_gas]
+    print("Done! Rescaling...")
+    x *= (float(Nx) / N_gas * 4 * np.pi / 3 / 8) ** (1.0 / 3) * R
+    print("Done! Recomupting radii...")
+    r = cdist(x, [np.zeros(3)])[:, 0]
+    x, r = x / r.max(), r / r.max()
+    print("Doing density profile...")
+    rnew = r ** (3.0 / (3 + density_exponent)) * R
+    x = x * (rnew / r)[:, None]
+    r = np.sum(x**2, axis=1) ** 0.5
 r_order = r.argsort()
 x, r = np.take(x, r_order, axis=0), r[r_order]
+if output_format == "grid":
+    idx = np.arange(N_gas)  # for mapping back to original order when writing a grid
+    idx = idx[r_order]
+    mgas = mgas[r_order]
+    rho = rho[r_order]
 
 if not os.path.exists(turb_path):
     os.makedirs(turb_path)
 fname = turb_path + "/vturb%d_sol%g_seed%d.npy" % (minmode, turb_sol, seed)
 if not os.path.isfile(fname):
-    vt = TurbField(res=grid_resolution, minmode=minmode, sol_weight=turb_sol, seed=seed)
+    vt = TurbField(res=turb_resolution, minmode=minmode, sol_weight=turb_sol, seed=seed)
     nmin, nmax = vt.shape[-1] // 4, 3 * vt.shape[-1] // 4
     vt = vt[
         :, nmin:nmax, nmin:nmax, nmin:nmax
@@ -403,10 +453,13 @@ else:
     vt = np.load(fname)
 
 xgrid = np.linspace(-R, R, vt.shape[-1])
-v = []
+v = np.zeros((N_gas,3))
+if output_format == "grid":
+    inside = r <= R
+else:
+    inside = Ellipsis
 for i in range(3):
-    v.append(interpolate.interpn((xgrid, xgrid, xgrid), vt[i, :, :, :], x))
-v = np.array(v).T
+    v[inside,i] = interpolate.interpn((xgrid, xgrid, xgrid), vt[i, :, :, :], x[inside])
 print("Coordinates obtained!")
 
 Mr = mgas.cumsum()
@@ -435,7 +488,8 @@ else:
     )  # renormalize to desired magnetic energy
 
 v = v - np.average(v, axis=0)
-x = x - np.average(x, axis=0)
+if output_format != "grid":
+    x = x - np.average(x, axis=0)
 
 r, phi = np.sum(x**2, axis=1) ** 0.5, np.arctan2(x[:, 1], x[:, 0])
 theta = np.arccos(x[:, 2] / r)
@@ -444,6 +498,14 @@ x = (
     r[:, np.newaxis]
     * np.c_[np.cos(phi) * np.sin(theta), np.sin(phi) * np.sin(theta), np.cos(theta)]
 )
+
+# Initial specific internal energy
+mh = 1.67373522e-24 # g
+kb = 1.3806488e-16  # erg/K
+mu = 1.22  # mean molecular weight (atomic)
+u = np.ones_like(mgas) * kb * cloud_temp / (mu*mh) / v_unit**2
+if output_format == "grid":
+    u[r > R] *= rho_contrast  # pressure equil
 
 if makecylinder:
 
@@ -470,8 +532,6 @@ if makecylinder:
     # tangential with magnitude increasing linearly
     v_cyl *= vrms_cyl
 
-u = np.ones_like(mgas) * 0.101 / 2.0  # /2 needed because it is molecular
-
 if impact_dist > 0:
     x = np.concatenate([x, x])
     impact_dir = {
@@ -496,13 +556,10 @@ if impact_dist > 0:
     u = np.concatenate([u, u])
     mgas = np.concatenate([mgas, mgas])
 
-u = (
-    np.ones_like(mgas) * (200 / v_unit) ** 2
-)  # start with specific internal energy of (200m/s)^2, this is overwritten unless starting with restart flag 2###### #0.101/2.0 #/2 needed because it is molecular
-
-if diffuse_gas:
+# Diffuse gas already done in grid format
+if diffuse_gas and output_format != "grid":
     # assuming 10K vs 10^4K gas: factor of ~10^3 density contrast
-    rho_warm = M_gas * 3 / (4 * np.pi * R**3) / 1000
+    rho_warm = M_gas * 3 / (4 * np.pi * R**3) / rho_contrast
     M_warm = (
         boxsize**3 - (4 * np.pi * R**3 / 3)
     ) * rho_warm  # mass of diffuse box-filling medium
@@ -566,10 +623,11 @@ if diffuse_gas:
 else:
     N_warm = 0
 
-rho = np.repeat(3 * M_gas / (4 * np.pi * R**3), len(mgas))
-if diffuse_gas:
-    rho[-N_warm:] /= 1000
-h = (32 * mgas / rho) ** (1.0 / 3)
+if output_format != "grid":
+    rho = np.repeat(3 * M_gas / (4 * np.pi * R**3), len(mgas))
+    if diffuse_gas:
+        rho[-N_warm:] /= 1000
+    h = (32 * mgas / rho) ** (1.0 / 3)
 
 x += boxsize / 2  # cloud is always centered at (boxsize/2,boxsize/2,boxsize/2)
 if makecylinder:
@@ -689,10 +747,35 @@ if output_format.lower() == "gadget":
             F["PartType0"].create_dataset("MagneticField", data=B_cyl)
         F.close()
 
-elif output_format.lower() == "grid":
-    F = h5.File(filename, 'w')
-    F.attrs["BoxSize"] = boxsize
-    F.attrs["GridDimensions"] = 
-    F.create_group("Grid00")
+elif output_format == "grid":
+    # Remap radius sorted and raveled list of points to a 3D lattice
+    def remap(f):
+        unsorted = np.empty_like(f)
+        unsorted[idx] = f
+        return unsorted.reshape([grid_resolution]*3)
+    
+    total_energy = 0.5*np.sum(v**2, axis=1)/v_unit**2 + u
+    temperature = u * (mu*mh/kb) * v_unit**2
 
+    F = h5py.File(filename, 'w')
+    F.attrs["BoxSize[pc]"] = boxsize
+    F.attrs["CloudMass[Msun]"] = M_gas
+    F.attrs["density_unit"] = density_unit
+    F.attrs["time_unit"] = t_unit
+    F.attrs["mass_unit"] = mass_unit
+    F.attrs["length_unit"] = length_unit
+    F.attrs["velocity_unit"] = v_unit
+    F.attrs["GridDimensions"] = [grid_resolution]*3
+    g = F.create_group("Grid00")
+    g.create_dataset("Density", data=remap(rho/density_unit))
+    g.create_dataset("GasEnergy", data=remap(u))
+    g.create_dataset("TotalEnergy", data=remap(total_energy))
+    g.create_dataset("x-velocity", data=remap(v.T[0]/v_unit))
+    g.create_dataset("y-velocity", data=remap(v.T[1]/v_unit))
+    g.create_dataset("z-velocity", data=remap(v.T[2]/v_unit))
+    g.create_dataset("Temperature", data=remap(temperature))
+    if magnetic_field > 0:
+        g.create_dataset("Bx", data=remap(B.T[0]/B_unit))
+        g.create_dataset("By", data=remap(B.T[1]/B_unit))
+        g.create_dataset("Bz", data=remap(B.T[2]/B_unit))
     F.close()

@@ -1,0 +1,9 @@
+# use glob syntax.
+syntax: glob
+
+*.hdf5
+params_M*.txt
+glass_orig.npy
+*~
+*.pyc
+.vscode
