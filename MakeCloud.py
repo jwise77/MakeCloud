@@ -9,7 +9,8 @@ Options:
    --R=<pc>             Outer radius of the cloud in pc [default: 20.0]
    --M=<msun>           Mass of the cloud in msun [default: 1e5]
    --filename=<name>    Name of the IC file to be generated
-   --N=<N>              Number of gas particles [default: 125000]
+   --N=<N>              Number of gas particles if particle output [default: 125000]
+   --res=<N>            Number of dimensions across if grid output [default: 256]
    --density_exponent=<f>   Power law exponent of the density profile [default: 0.0]
    --spin=<f>           Spin parameter: fraction of binding energy in solid-body rotation [default: 0.0]
    --omega_exponent=<f>  Powerlaw exponent of rotational frequency as a function of cylindrical radius [default: 0.0]
@@ -48,6 +49,7 @@ Options:
    --cyl_aspect_ratio=<f>   Sets the aspect ratio of the cylinder, i.e. Length/Diameter [default: 10]
    --Z=<solar>          Metallicity of the cloud in Solar units (just for params file) [default: 1.0]
    --ISRF=<solar>       Interstellar radiation background of the cloud in Solar neighborhood units (just for params file) [default: 1.0]
+   --output=<type>      Output format: 'gadget' or 'grid' [default: gadget]
 """
 # Example:  python MakeCloud.py --M=1000 --N=1e7 --R=1.0 --localdir --param_only
 
@@ -133,6 +135,7 @@ arguments = docopt(__doc__)
 R = float(arguments["--R"])
 M_gas = float(arguments["--M"])
 N_gas = int(float(arguments["--N"]) + 0.5)
+grid_resolution = int(float(arguments["--res"]) + 0.5)
 M_star = float(arguments["--Mstar"])
 v_star = np.array([float(v) for v in arguments["--v_star"].split(",")])
 spin = float(arguments["--spin"])
@@ -166,13 +169,14 @@ fixed_ncrit = float(arguments["--fixed_ncrit"])
 density_exponent = float(arguments["--density_exponent"])
 metallicity = float(arguments["--Z"])
 ISRF = float(arguments["--ISRF"])
+output_format = arguments["--output"].lower()
 if arguments["--turb_path"]:
     turb_path = arguments["--turb_path"]
 else:
     turb_path = os.path.expanduser("~") + "/turb"
 if arguments["--glass_path"]:
     glass_path = arguments["--glass_path"]
-else:
+elif output_format != "grid":
     glass_path = os.path.expanduser("~") + "/glass_orig.npy"
     if not os.path.exists(glass_path):
         import urllib.request
@@ -182,10 +186,12 @@ else:
             "http://www.tapir.caltech.edu/~mgrudich/glass_orig.npy", glass_path
 #            "https://data.obs.carnegiescience.edu/starforge/glass_orig.npy", glass_path
         )
+else:
+    glass_path = None
 
 if localdir:
     turb_path = "turb"
-    glass_path = "glass_256.npy"
+    glass_path = "glass_256.npy" if output_format.lower() != "grid" else None
 
 if arguments["--boxsize"] is not None:
     boxsize = float(arguments["--boxsize"])
@@ -199,7 +205,11 @@ else:  # default to center of box
 
 derefinement = arguments["--derefinement"]
 
-res_effective = int(N_gas ** (1.0 / 3.0) + 0.5)
+if output_format == "grid":
+    res_effective = grid_resolution
+    N_gas = grid_resolution**3
+else:
+    res_effective = int(N_gas ** (1.0 / 3.0) + 0.5)
 phimode = float(arguments["--phimode"])
 
 filename = (
@@ -358,7 +368,8 @@ if param_only:
 
 dm = M_gas / N_gas
 mgas = np.repeat(dm, N_gas)
-
+if output_format == "grid":
+    x = np.linspace(-R, R, [grid_resolution]*3)
 x = get_glass_coords(N_gas, glass_path)
 Nx = len(x)
 x = 2 * (x - 0.5)
@@ -382,7 +393,7 @@ if not os.path.exists(turb_path):
     os.makedirs(turb_path)
 fname = turb_path + "/vturb%d_sol%g_seed%d.npy" % (minmode, turb_sol, seed)
 if not os.path.isfile(fname):
-    vt = TurbField(minmode=minmode, sol_weight=turb_sol, seed=seed)
+    vt = TurbField(res=grid_resolution, minmode=minmode, sol_weight=turb_sol, seed=seed)
     nmin, nmax = vt.shape[-1] // 4, 3 * vt.shape[-1] // 4
     vt = vt[
         :, nmin:nmax, nmin:nmax, nmin:nmax
@@ -566,113 +577,122 @@ if makecylinder:
 
 print("Writing snapshot...")
 
-F = h5py.File(filename, "w")
-F.create_group("PartType0")
-F.create_group("Header")
-F["Header"].attrs["NumPart_ThisFile"] = [
-    len(mgas),
-    0,
-    0,
-    0,
-    0,
-    (1 if M_star > 0 else 0),
-]
-F["Header"].attrs["NumPart_Total"] = [len(mgas), 0, 0, 0, 0, (1 if M_star > 0 else 0)]
-F["Header"].attrs["BoxSize"] = boxsize
-F["Header"].attrs["Time"] = 0.0
-F["PartType0"].create_dataset("Masses", data=mgas)
-F["PartType0"].create_dataset("Coordinates", data=x)
-F["PartType0"].create_dataset("Velocities", data=v)
-F["PartType0"].create_dataset("ParticleIDs", data=1 + np.arange(len(mgas)))
-F["PartType0"].create_dataset("InternalEnergy", data=u)
-
-if M_star > 0:
-    F.create_group("PartType5")
-    # Let's add the sink at the center
-    F["PartType5"].create_dataset("Masses", data=np.array([M_star]))
-    F["PartType5"].create_dataset("Coordinates", data=[x_star])  # at the center
-    F["PartType5"].create_dataset("Velocities", data=[v_star])  # at rest
-    F["PartType5"].create_dataset(
-        "ParticleIDs", data=np.array([F["PartType0/ParticleIDs"][:].max() + 1])
-    )
-    # Advanced properties for sinks
-    F["PartType5"].create_dataset(
-        "BH_Mass", data=M_star
-    )  # all the mass in the sink/protostar/star
-    F["PartType5"].create_dataset(
-        "BH_Mass_AlphaDisk", data=np.array([0.0])
-    )  # starts with no disk
-    F["PartType5"].create_dataset(
-        "BH_Mdot", data=np.array([0.0])
-    )  # starts with no mdot
-    F["PartType5"].create_dataset(
-        "BH_Specific_AngMom", data=np.array([0.0])
-    )  # starts with no angular momentum
-    F["PartType5"].create_dataset(
-        "SinkRadius", data=np.array([softening])
-    )  # Sinkradius set to softening
-    F["PartType5"].create_dataset("StellarFormationTime", data=np.array([0.0]))
-    F["PartType5"].create_dataset("ProtoStellarAge", data=np.array([0.0]))
-    F["PartType5"].create_dataset(
-        "ProtoStellarStage", data=np.array([5], dtype=np.int32), dtype=np.int32
-    )
-    # Stellar properties
-    # if (central_star or central_SN):
-    # if central_star:
-    #       print("Assuming central sink is a ZAMS star")
-    # starts as ZAMS star
-    # else:
-    # print("Assuming central sink is a ZAMS star about to go supernova")
-    # F["PartType5"].create_dataset("ProtoStellarStage", data=np.array([6],dtype=np.int32), dtype=np.int32) #starts as ZAMS star going SN
-    # Set guess for ZAMS stellar radius, will be overwritten
-    if (M_star) > 1.0:
-        R_ZAMS = (M_star) ** 0.57
-    else:
-        R_ZAMS = (M_star) ** 0.8
-    F["PartType5"].create_dataset(
-        "ProtoStellarRadius_inSolar", data=np.array([R_ZAMS])
-    )  # Sinkradius set to softening
-    F["PartType5"].create_dataset("StarLuminosity_Solar", data=np.array([0.0]))  # dummy
-    F["PartType5"].create_dataset("Mass_D", data=np.array([0.0]))  # No D left
-
-if magnetic_field > 0.0:
-    F["PartType0"].create_dataset("MagneticField", data=B)
-F.close()
-
-if makebox:
-    F = h5py.File(filename.replace(".hdf5", "_BOX.hdf5"), "w")
+if output_format.lower() == "gadget":
+    F = h5py.File(filename, "w")
     F.create_group("PartType0")
     F.create_group("Header")
-    F["Header"].attrs["NumPart_ThisFile"] = [len(mgas), 0, 0, 0, 0, 0]
-    F["Header"].attrs["NumPart_Total"] = [len(mgas), 0, 0, 0, 0, 0]
-    F["Header"].attrs["MassTable"] = [M_gas / len(mgas), 0, 0, 0, 0, 0]
-    F["Header"].attrs["BoxSize"] = (4 * np.pi * R**3 / 3) ** (1.0 / 3)
-    F["Header"].attrs["Time"] = 0.0
-    F["PartType0"].create_dataset("Masses", data=mgas[: len(mgas)])
-    F["PartType0"].create_dataset(
-        "Coordinates", data=np.random.rand(len(mgas), 3) * F["Header"].attrs["BoxSize"]
-    )
-    F["PartType0"].create_dataset("Velocities", data=np.zeros((len(mgas), 3)))
-    F["PartType0"].create_dataset("ParticleIDs", data=1 + np.arange(len(mgas)))
-    F["PartType0"].create_dataset("InternalEnergy", data=u)
-    if magnetic_field > 0.0:
-        F["PartType0"].create_dataset("MagneticField", data=B[: len(mgas)])
-    F.close()
-
-if makecylinder:
-    F = h5py.File(filename.replace(".hdf5", "_CYL.hdf5"), "w")
-    F.create_group("PartType0")
-    F.create_group("Header")
-    F["Header"].attrs["NumPart_ThisFile"] = [N_gas + N_warm_cyl, 0, 0, 0, 0, 0]
-    F["Header"].attrs["NumPart_Total"] = [N_gas + N_warm_cyl, 0, 0, 0, 0, 0]
-    F["Header"].attrs["MassTable"] = [M_gas / N_gas, 0, 0, 0, 0, 0]
-    F["Header"].attrs["BoxSize"] = boxsize_cyl
+    F["Header"].attrs["NumPart_ThisFile"] = [
+        len(mgas),
+        0,
+        0,
+        0,
+        0,
+        (1 if M_star > 0 else 0),
+    ]
+    F["Header"].attrs["NumPart_Total"] = [len(mgas), 0, 0, 0, 0, (1 if M_star > 0 else 0)]
+    F["Header"].attrs["BoxSize"] = boxsize
     F["Header"].attrs["Time"] = 0.0
     F["PartType0"].create_dataset("Masses", data=mgas)
-    F["PartType0"].create_dataset("Coordinates", data=x_cyl)
-    F["PartType0"].create_dataset("Velocities", data=v_cyl)
-    F["PartType0"].create_dataset("ParticleIDs", data=1 + np.arange(N_gas + N_warm_cyl))
+    F["PartType0"].create_dataset("Coordinates", data=x)
+    F["PartType0"].create_dataset("Velocities", data=v)
+    F["PartType0"].create_dataset("ParticleIDs", data=1 + np.arange(len(mgas)))
     F["PartType0"].create_dataset("InternalEnergy", data=u)
+
+    if M_star > 0:
+        F.create_group("PartType5")
+        # Let's add the sink at the center
+        F["PartType5"].create_dataset("Masses", data=np.array([M_star]))
+        F["PartType5"].create_dataset("Coordinates", data=[x_star])  # at the center
+        F["PartType5"].create_dataset("Velocities", data=[v_star])  # at rest
+        F["PartType5"].create_dataset(
+            "ParticleIDs", data=np.array([F["PartType0/ParticleIDs"][:].max() + 1])
+        )
+        # Advanced properties for sinks
+        F["PartType5"].create_dataset(
+            "BH_Mass", data=M_star
+        )  # all the mass in the sink/protostar/star
+        F["PartType5"].create_dataset(
+            "BH_Mass_AlphaDisk", data=np.array([0.0])
+        )  # starts with no disk
+        F["PartType5"].create_dataset(
+            "BH_Mdot", data=np.array([0.0])
+        )  # starts with no mdot
+        F["PartType5"].create_dataset(
+            "BH_Specific_AngMom", data=np.array([0.0])
+        )  # starts with no angular momentum
+        F["PartType5"].create_dataset(
+            "SinkRadius", data=np.array([softening])
+        )  # Sinkradius set to softening
+        F["PartType5"].create_dataset("StellarFormationTime", data=np.array([0.0]))
+        F["PartType5"].create_dataset("ProtoStellarAge", data=np.array([0.0]))
+        F["PartType5"].create_dataset(
+            "ProtoStellarStage", data=np.array([5], dtype=np.int32), dtype=np.int32
+        )
+        # Stellar properties
+        # if (central_star or central_SN):
+        # if central_star:
+        #       print("Assuming central sink is a ZAMS star")
+        # starts as ZAMS star
+        # else:
+        # print("Assuming central sink is a ZAMS star about to go supernova")
+        # F["PartType5"].create_dataset("ProtoStellarStage", data=np.array([6],dtype=np.int32), dtype=np.int32) #starts as ZAMS star going SN
+        # Set guess for ZAMS stellar radius, will be overwritten
+        if (M_star) > 1.0:
+            R_ZAMS = (M_star) ** 0.57
+        else:
+            R_ZAMS = (M_star) ** 0.8
+        F["PartType5"].create_dataset(
+            "ProtoStellarRadius_inSolar", data=np.array([R_ZAMS])
+        )  # Sinkradius set to softening
+        F["PartType5"].create_dataset("StarLuminosity_Solar", data=np.array([0.0]))  # dummy
+        F["PartType5"].create_dataset("Mass_D", data=np.array([0.0]))  # No D left
+
     if magnetic_field > 0.0:
-        F["PartType0"].create_dataset("MagneticField", data=B_cyl)
+        F["PartType0"].create_dataset("MagneticField", data=B)
+    F.close()
+
+    if makebox:
+        F = h5py.File(filename.replace(".hdf5", "_BOX.hdf5"), "w")
+        F.create_group("PartType0")
+        F.create_group("Header")
+        F["Header"].attrs["NumPart_ThisFile"] = [len(mgas), 0, 0, 0, 0, 0]
+        F["Header"].attrs["NumPart_Total"] = [len(mgas), 0, 0, 0, 0, 0]
+        F["Header"].attrs["MassTable"] = [M_gas / len(mgas), 0, 0, 0, 0, 0]
+        F["Header"].attrs["BoxSize"] = (4 * np.pi * R**3 / 3) ** (1.0 / 3)
+        F["Header"].attrs["Time"] = 0.0
+        F["PartType0"].create_dataset("Masses", data=mgas[: len(mgas)])
+        F["PartType0"].create_dataset(
+            "Coordinates", data=np.random.rand(len(mgas), 3) * F["Header"].attrs["BoxSize"]
+        )
+        F["PartType0"].create_dataset("Velocities", data=np.zeros((len(mgas), 3)))
+        F["PartType0"].create_dataset("ParticleIDs", data=1 + np.arange(len(mgas)))
+        F["PartType0"].create_dataset("InternalEnergy", data=u)
+        if magnetic_field > 0.0:
+            F["PartType0"].create_dataset("MagneticField", data=B[: len(mgas)])
+        F.close()
+
+    if makecylinder:
+        F = h5py.File(filename.replace(".hdf5", "_CYL.hdf5"), "w")
+        F.create_group("PartType0")
+        F.create_group("Header")
+        F["Header"].attrs["NumPart_ThisFile"] = [N_gas + N_warm_cyl, 0, 0, 0, 0, 0]
+        F["Header"].attrs["NumPart_Total"] = [N_gas + N_warm_cyl, 0, 0, 0, 0, 0]
+        F["Header"].attrs["MassTable"] = [M_gas / N_gas, 0, 0, 0, 0, 0]
+        F["Header"].attrs["BoxSize"] = boxsize_cyl
+        F["Header"].attrs["Time"] = 0.0
+        F["PartType0"].create_dataset("Masses", data=mgas)
+        F["PartType0"].create_dataset("Coordinates", data=x_cyl)
+        F["PartType0"].create_dataset("Velocities", data=v_cyl)
+        F["PartType0"].create_dataset("ParticleIDs", data=1 + np.arange(N_gas + N_warm_cyl))
+        F["PartType0"].create_dataset("InternalEnergy", data=u)
+        if magnetic_field > 0.0:
+            F["PartType0"].create_dataset("MagneticField", data=B_cyl)
+        F.close()
+
+elif output_format.lower() == "grid":
+    F = h5.File(filename, 'w')
+    F.attrs["BoxSize"] = boxsize
+    F.attrs["GridDimensions"] = 
+    F.create_group("Grid00")
+
     F.close()
